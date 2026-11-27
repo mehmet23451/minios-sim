@@ -144,13 +144,13 @@ static void record_gantt(sched_result_t *res, const char *label, int start, int 
     }
 }
 
-static void move_to_ready(pcb_t *p, int tick, int *ready_q, int *rq_len, bool trace) {
+static void move_to_ready(pcb_t *p, int proc_idx, int tick, int *ready_q, int *rq_len, bool trace) {
     if (p->state == STATE_READY) return;
     proc_state_t old = p->state;
     p->state = STATE_READY;
     p->ready_since = tick;
     p->quantum_used = 0;
-    ready_q[(*rq_len)++] = p->order_seq;
+    ready_q[(*rq_len)++] = proc_idx;
     if (trace) {
         const char *old_s = (old == STATE_NEW) ? "NEW" :
                             (old == STATE_WAITING) ? "WAITING" :
@@ -159,61 +159,12 @@ static void move_to_ready(pcb_t *p, int tick, int *ready_q, int *rq_len, bool tr
     }
 }
 
-static void remove_from_ready(int idx, int *ready_q, int *rq_len) {
-    int pos = -1;
-    for (int i = 0; i < *rq_len; i++) {
-        if (ready_q[i] == idx) {
-            pos = i;
-            break;
-        }
+static void pop_ready_front(int *ready_q, int *rq_len) {
+    if (*rq_len <= 0) return;
+    for (int i = 0; i + 1 < *rq_len; i++) {
+        ready_q[i] = ready_q[i + 1];
     }
-    if (pos >= 0) {
-        for (int i = pos; i + 1 < *rq_len; i++) {
-            ready_q[i] = ready_q[i + 1];
-        }
-        (*rq_len)--;
-    }
-}
-
-static int pick_next_ready(const pcb_t *procs, const int *ready_q, int rq_len, sched_policy_t policy) {
-    if (rq_len <= 0) return -1;
-    if (policy == POLICY_FCFS || policy == POLICY_RR) {
-        return ready_q[0];
-    }
-
-    int best = -1;
-    for (int k = 0; k < rq_len; k++) {
-        int idx = ready_q[k];
-        const pcb_t *p = &procs[idx];
-        if (best < 0) {
-            best = idx;
-            continue;
-        }
-        const pcb_t *b = &procs[best];
-        bool take = false;
-        if (policy == POLICY_SJF) {
-            int p_len = p->bursts[p->burst_idx];
-            int b_len = b->bursts[b->burst_idx];
-            if (p_len != b_len) take = (p_len < b_len);
-        } else if (policy == POLICY_SRTF) {
-            if (p->rem_burst != b->rem_burst) take = (p->rem_burst < b->rem_burst);
-        } else if (policy == POLICY_PRIO) {
-            if (p->curr_prio != b->curr_prio) take = (p->curr_prio < b->curr_prio);
-        }
-
-        if (!take && ((policy == POLICY_SJF && p->bursts[p->burst_idx] == b->bursts[b->burst_idx]) ||
-                      (policy == POLICY_SRTF && p->rem_burst == b->rem_burst) ||
-                      (policy == POLICY_PRIO && p->curr_prio == b->curr_prio))) {
-            if (p->ready_since != b->ready_since) {
-                take = (p->ready_since < b->ready_since);
-            } else {
-                take = (strcmp(p->pid, b->pid) < 0);
-            }
-        }
-
-        if (take) best = idx;
-    }
-    return best;
+    (*rq_len)--;
 }
 
 static int cmp_pid_asc(const void *a, const void *b) {
@@ -224,14 +175,15 @@ static int cmp_pid_asc(const void *a, const void *b) {
 
 bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts, sched_result_t *out_res) {
     if (!init_procs || num_procs <= 0 || !opts || !out_res) return false;
+    if (opts->policy != POLICY_FCFS) return false;
+
     memset(out_res, 0, sizeof(*out_res));
-    out_res->policy = opts->policy;
+    out_res->policy = POLICY_FCFS;
     out_res->num_procs = num_procs;
 
     pcb_t p[MAX_PROCS];
     for (int i = 0; i < num_procs; i++) {
         p[i] = init_procs[i];
-        p[i].order_seq = i;
         p[i].state = STATE_NEW;
         p[i].burst_idx = 0;
         p[i].rem_burst = p[i].bursts[0];
@@ -239,6 +191,11 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
         p[i].first_dispatch = -1;
         p[i].quantum_used = 0;
         p[i].curr_prio = p[i].base_prio;
+    }
+
+    qsort(p, (size_t)num_procs, sizeof(pcb_t), cmp_pid_asc);
+    for (int i = 0; i < num_procs; i++) {
+        p[i].order_seq = i;
     }
 
     int ready_q[MAX_PROCS];
@@ -256,16 +213,16 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
             if (p[i].state == STATE_WAITING && p[i].rem_burst <= 0) {
                 p[i].burst_idx++;
                 p[i].rem_burst = p[i].bursts[p[i].burst_idx];
-                move_to_ready(&p[i], tick, ready_q, &rq_len, opts->trace);
+                move_to_ready(&p[i], i, tick, ready_q, &rq_len, opts->trace);
             }
         }
         for (int i = 0; i < num_procs; i++) {
             if (p[i].state == STATE_NEW && p[i].arrival <= tick) {
-                move_to_ready(&p[i], tick, ready_q, &rq_len, opts->trace);
+                move_to_ready(&p[i], i, tick, ready_q, &rq_len, opts->trace);
             }
         }
 
-        /* 2. Handle running process completion, quantum expiry, or preemption */
+        /* 2. Handle running process completion (FCFS is non-preemptive) */
         if (running >= 0) {
             pcb_t *rp = &p[running];
             if (rp->rem_burst <= 0) {
@@ -291,45 +248,20 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
                     }
                 }
                 running = -1;
-            } else if (opts->policy == POLICY_RR && rp->quantum_used >= opts->quantum) {
-                if (has_cur_label) {
-                    record_gantt(out_res, cur_label, seg_start, tick);
-                    has_cur_label = false;
-                }
-                move_to_ready(rp, tick, ready_q, &rq_len, opts->trace);
-                running = -1;
-            } else if (opts->policy == POLICY_SRTF || opts->policy == POLICY_PRIO) {
-                int cand = pick_next_ready(p, ready_q, rq_len, opts->policy);
-                bool preempt = false;
-                if (cand >= 0) {
-                    if (opts->policy == POLICY_SRTF && p[cand].rem_burst < rp->rem_burst) {
-                        preempt = true;
-                    } else if (opts->policy == POLICY_PRIO && p[cand].curr_prio < rp->curr_prio) {
-                        preempt = true;
-                    }
-                }
-                if (preempt) {
-                    if (has_cur_label) {
-                        record_gantt(out_res, cur_label, seg_start, tick);
-                        has_cur_label = false;
-                    }
-                    move_to_ready(rp, tick, ready_q, &rq_len, opts->trace);
-                    running = -1;
-                }
             }
         }
 
         if (terminated >= num_procs) break;
 
-        /* 3. Dispatch if CPU is free */
+        /* 3. Dispatch next FCFS process if CPU is free */
         if (running < 0) {
-            int next = pick_next_ready(p, ready_q, rq_len, opts->policy);
-            if (next >= 0) {
+            if (rq_len > 0) {
                 if (has_cur_label && strcmp(cur_label, "IDLE") == 0) {
                     record_gantt(out_res, "IDLE", seg_start, tick);
                     has_cur_label = false;
                 }
-                remove_from_ready(next, ready_q, &rq_len);
+                int next = ready_q[0];
+                pop_ready_front(ready_q, &rq_len);
                 pcb_t *np = &p[next];
                 if (np->first_dispatch < 0) {
                     np->first_dispatch = tick;
@@ -342,13 +274,10 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
                     seg_start = tick;
                     has_cur_label = true;
                     if (tick > 0 || out_res->context_switches > 0) {
-
                         out_res->context_switches++;
                     }
                 }
                 np->state = STATE_RUNNING;
-                np->quantum_used = 0;
-                np->curr_prio = np->base_prio;
                 running = next;
                 if (opts->trace) {
                     printf("[t=%d] %s: READY -> RUNNING\n", tick, np->pid);
@@ -369,9 +298,6 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
         for (int i = 0; i < num_procs; i++) {
             if (p[i].state == STATE_READY) {
                 p[i].wait_accum++;
-                if (opts->policy == POLICY_PRIO && (tick - p[i].ready_since) > 0 && ((tick - p[i].ready_since) % 5 == 0)) {
-                    if (p[i].curr_prio > 0) p[i].curr_prio--;
-                }
             } else if (p[i].state == STATE_WAITING) {
                 p[i].rem_burst--;
             }
@@ -379,7 +305,6 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
 
         if (running >= 0) {
             p[running].rem_burst--;
-            p[running].quantum_used++;
             out_res->busy_ticks++;
         }
 
@@ -393,7 +318,6 @@ bool sched_run(const pcb_t *init_procs, int num_procs, const sched_opts_t *opts,
         p[i].waiting = p[i].wait_accum;
         out_res->procs[i] = p[i];
     }
-    qsort(out_res->procs, (size_t)num_procs, sizeof(pcb_t), cmp_pid_asc);
 
     return true;
 }
@@ -439,26 +363,8 @@ void sched_print_csv(const sched_result_t *res) {
 }
 
 void sched_print_compare(const pcb_t *init_procs, int num_procs, const sched_opts_t *base_opts) {
-    sched_policy_t policies[5] = {POLICY_FCFS, POLICY_SJF, POLICY_SRTF, POLICY_PRIO, POLICY_RR};
-    printf("Policy\tAvgTAT\tAvgWT\tAvgRT\tUtil%%\tThr/100\tCS\n");
-    for (int k = 0; k < 5; k++) {
-        sched_opts_t o = *base_opts;
-        o.policy = policies[k];
-        o.trace = false;
-        o.csv = false;
-        sched_result_t r;
-        if (sched_run(init_procs, num_procs, &o, &r)) {
-            double tat = 0.0, wt = 0.0, rt = 0.0;
-            for (int i = 0; i < r.num_procs; i++) {
-                tat += r.procs[i].turnaround;
-                wt += r.procs[i].waiting;
-                rt += r.procs[i].response;
-            }
-            double util = (r.total_ticks > 0) ? (100.0 * r.busy_ticks / r.total_ticks) : 0.0;
-            double thr  = (r.total_ticks > 0) ? (100.0 * r.num_procs / r.total_ticks) : 0.0;
-            printf("%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%d\n",
-                   sched_policy_name(r.policy), tat / r.num_procs, wt / r.num_procs, rt / r.num_procs,
-                   util, thr, r.context_switches);
-        }
-    }
+    /* Added in a later commit once all five baseline policies are implemented */
+    (void)init_procs;
+    (void)num_procs;
+    (void)base_opts;
 }
